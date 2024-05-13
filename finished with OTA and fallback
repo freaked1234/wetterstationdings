@@ -1,0 +1,516 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Stepper.h>
+#include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
+//OTA update stuff
+#include <WiFiClient.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Update.h>
+
+
+// OTA Update Stuff
+
+const char* host = "esp32";
+
+WebServer server(80);
+
+/*
+ * Login page
+ */
+const char* loginIndex = 
+ "<form name='loginForm'>"
+    "<table width='20%' bgcolor='A09F9F' align='center'>"
+        "<tr>"
+            "<td colspan=2>"
+                "<center><font size=4><b>ESP32 Login Page</b></font></center>"
+                "<br>"
+            "</td>"
+            "<br>"
+            "<br>"
+        "</tr>"
+        "<td>Username:</td>"
+        "<td><input type='text' size=25 name='userid'><br></td>"
+        "</tr>"
+        "<br>"
+        "<br>"
+        "<tr>"
+            "<td>Password:</td>"
+            "<td><input type='Password' size=25 name='pwd'><br></td>"
+            "<br>"
+            "<br>"
+        "</tr>"
+        "<tr>"
+            "<td><input type='submit' onclick='check(this.form)' value='Login'></td>"
+        "</tr>"
+    "</table>"
+"</form>"
+"<script>"
+    "function check(form)"
+    "{"
+    "if(form.userid.value=='admin' && form.pwd.value=='admin')"
+    "{"
+    "window.open('/serverIndex')"
+    "}"
+    "else"
+    "{"
+    " alert('Error Password or Username')/*displays error message*/"
+    "}"
+    "}"
+"</script>";
+ 
+/*
+ * Server Index Page
+ */
+ 
+const char* serverIndex = 
+"<script src='https://ajax.googleapis.com/ajax/libs/jquery/3.2.1/jquery.min.js'></script>"
+"<form method='POST' action='#' enctype='multipart/form-data' id='upload_form'>"
+   "<input type='file' name='update'>"
+        "<input type='submit' value='Update'>"
+    "</form>"
+ "<div id='prg'>progress: 0%</div>"
+ "<script>"
+  "$('form').submit(function(e){"
+  "e.preventDefault();"
+  "var form = $('#upload_form')[0];"
+  "var data = new FormData(form);"
+  " $.ajax({"
+  "url: '/update',"
+  "type: 'POST',"
+  "data: data,"
+  "contentType: false,"
+  "processData:false,"
+  "xhr: function() {"
+  "var xhr = new window.XMLHttpRequest();"
+  "xhr.upload.addEventListener('progress', function(evt) {"
+  "if (evt.lengthComputable) {"
+  "var per = evt.loaded / evt.total;"
+  "$('#prg').html('progress: ' + Math.round(per*100) + '%');"
+  "}"
+  "}, false);"
+  "return xhr;"
+  "},"
+  "success:function(d, s) {"
+  "console.log('success!')" 
+ "},"
+ "error: function (a, b, c) {"
+ "}"
+ "});"
+ "});"
+ "</script>";
+
+
+
+
+
+// Stepper 1
+const int stepsPerRevolution = 2048; // Steps per full revolution
+int tempSteps = 0;
+Stepper stepper(stepsPerRevolution, 5, 19, 18, 21); // Pins for stepper driver ULN2003 
+volatile int currentPosition = 0; // current motor position
+const int hallSensorPin = 34;
+const float startPosition = 90; // Starting position in degree
+const float degPerStep = 360; // 
+
+// Stepper 2
+
+Stepper stepper2(stepsPerRevolution, 12, 27, 14, 26); // Pins for second stepper driver ULN2003
+const int hallSensor2Pin = 35;
+const float startWeatherPosition = 0; // Startposition  Weather-Hand (in Degree)
+const float degPerStepWeather = 45; // not used
+volatile float currentPositionWeather = 0; // current position weather hand
+
+int targetPosition = 0;
+const int potPin = 32; // Potentiometer/Day-selector
+
+const char* ssid = "SSID";
+const char* password = "pass";
+
+
+double tempHeute = 30;
+double tempMorgen = 20;
+double tempUbermorgen = 10;
+String witterungHeute = "clear";
+String witterungMorgen = "clouds";
+String witterungUbermorgen = "snow";
+
+//touch sensor
+const int touchPin = 4; 
+const int threshold = 20;
+int touchValue;
+
+//relais
+const int relaisPin = 25;
+bool lichtEin = 0;
+
+
+int prevSelection = -1;
+int potValue = 0;
+unsigned long prevTime = 0;
+const int updateInterval = 3600000; // 1 hour in milliseconds
+
+void calibrateStepper() {
+
+//Rotate motor 1 step at a time until hall sensor gets triggered  
+ Serial.print("Kalibriere Temperatur");
+ pinMode(hallSensorPin, INPUT_PULLUP); // config hall sensor with internal pullup
+
+ stepper.setSpeed(5); // stepper1 speed
+
+ while (digitalRead(hallSensorPin) != LOW) {
+  stepper.step(1); 
+  delay(5);
+ }
+
+ stepper.step(0); // stop motor when hall sensor triggers
+ //stepper.step(1707);
+ int currentPositionWeather = 31; // fine tuning for offset from trigger point
+ Serial.print("Kalibrierung Temperatur abgeschlossen, Position: ");
+ Serial.println(currentPositionWeather);
+}
+
+void calibrateStepper2() {
+  // same calibration process as before
+  Serial.print("Kalibriere Wetter");
+  pinMode(hallSensor2Pin, INPUT_PULLUP); 
+
+  stepper2.setSpeed(10);
+
+  while (digitalRead(hallSensor2Pin) != LOW) {
+    stepper2.step(1); 
+    delay(5);
+  }
+
+  stepper2.step(0); // 
+
+  int currentPositionWeather = 0; 
+  Serial.print("Kalibrierung Wetter abgeschlossen, Position: ");
+  Serial.println(currentPositionWeather);
+}
+
+void moveToTemperature(int bewegungTemp) {
+// move stepper to input temp position
+
+  // licht ein, falls gewollt
+  // if (lichtEin == 1) {
+  //   digitalWrite(relaisPin, LOW);
+  // }
+
+
+  targetPosition = bewegungTemp;
+  tempSteps = abs(targetPosition - currentPosition) * (2048 / 60);
+
+
+   if (targetPosition > currentPosition) {
+    stepper.step(tempSteps);
+  } else {
+    stepper.step(-tempSteps);
+  }
+
+  delay(1000);
+  currentPosition = targetPosition;
+
+ 
+
+}
+
+
+void moveToWeather(String input) {
+// move stepper 2 to selected weather symbol
+  int targetPosition = 0;
+    if(input == "Clear") {
+    targetPosition = 0;
+  } else if(input == "Clouds") {
+    targetPosition = 341;
+  } else if(input == "Drizzle") {
+    targetPosition = 682;
+  } else if(input == "Snow") {
+    targetPosition = 1024;
+  } else if(input == "Thunderstorm") {
+    targetPosition = 1364;
+  } else if(input == "Rain") {
+    targetPosition = 1705;
+  }
+  
+  int stepsToMove = targetPosition - currentPositionWeather;
+  
+  if(stepsToMove < 0) {
+    stepsToMove += stepsPerRevolution;
+  }
+  
+  stepper2.step(stepsToMove);
+  currentPositionWeather = targetPosition;
+
+digitalWrite(relaisPin, HIGH);
+
+}
+
+void updateWeatherData() {
+  // make api call for weather data and parse desired values
+  Serial.print("Hole Wetterdaten");
+  HTTPClient http;
+  delay(5000);
+  char url[200];
+  strcpy(url, "https://api.openweathermap.org/data/3.0/onecall?lat=999&lon=999&exclude=hourly,minutely,alerts&cnt=3&appid=APIKEY&units=metric");
+  http.begin(url);
+
+    http.begin(url);
+
+  int httpCode = http.GET();
+
+  if (httpCode > 0) {
+    String payload = http.getString();
+
+    StaticJsonDocument<1024> doc;
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (error) {
+      Serial.print("deserializeJson() failed: ");
+      Serial.println(error.c_str());
+      return;
+    }
+
+    tempHeute = doc["current"]["temp"]; //get temperature value for NOW
+    tempMorgen = doc["daily"][1]["temp"]["day"]; // get temperature value for tomorrow (day)
+    tempUbermorgen = doc["daily"][2]["temp"]["day"]; // get temperature value for day after tomorrow (day)
+
+    witterungHeute = doc["current"]["weather"][0]["main"].as<String>(); //get weather condition for NOW
+    witterungMorgen = doc["daily"][1]["weather"][0]["main"].as<String>(); // get weather condition for tomorrow (day)
+    witterungUbermorgen = doc["daily"][2]["weather"][0]["main"].as<String>(); // get weather condition for day after tomorrow (day)
+
+    Serial.print("Temperature for today: ");
+    Serial.println(tempHeute);
+    Serial.print("Weather for today: ");
+    Serial.println(witterungHeute);
+    Serial.print("Temperature for tomorrow: ");
+    Serial.println(tempMorgen);
+    Serial.print("Weather for tomorrow: ");
+    Serial.println(witterungMorgen);
+    Serial.print("Temperature for the day after tomorrow: ");
+    Serial.println(tempUbermorgen);
+    Serial.print("Weather for the day after tomorrow: ");
+    Serial.println(witterungUbermorgen);
+  } else {
+    Serial.println("Error on HTTP request");
+  }
+
+  http.end();
+
+// licht aus
+  //digitalWrite(relaisPin, LOW);
+}
+
+void connectWifi() {
+  WiFi.begin(ssid, password);
+  Serial.println("Connecting");
+  while(WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.print("Connected to WiFi network with IP Address: ");
+  Serial.println(WiFi.localIP());
+ 
+  Serial.println("Timer set to 10 seconds (timerDelay variable), it will take 10 seconds before publishing the first reading.");
+}
+
+void configModeCallback (WiFiManager *myWiFiManager) {
+  Serial.println("Entered config mode");
+  Serial.println(WiFi.softAPIP());
+
+  Serial.println(myWiFiManager->getConfigPortalSSID());
+}
+
+
+
+
+////////////////////////////////////////////////////
+////////////////////////////////////////////////////
+////////////////////////////////////////////////////
+////////////////////////////////////////////////////
+////////////////////////////////////////////////////
+////////////////////////////////////////////////////
+
+
+
+
+void setup() {
+digitalWrite(relaisPin, HIGH); //Lightbulb off
+
+//Serial Monitor start
+  Serial.begin(115200);
+
+//Fallback hotspot config
+    WiFiManager wm;
+    bool res;
+    res = wm.autoConnect("Sarahs-Wetterstation"); // AP name
+
+    if(!res) {
+        Serial.println("Failed to connect");
+        // ESP.restart();
+    } 
+    else {
+        //if you get here you have connected to the WiFi    
+        Serial.println("connected...yeey :)");
+    }
+
+
+
+currentPosition = 30;
+ // Connect WiFi
+//  connectWifi(); //not needed with fallback hotspot
+  //Calibrate stepper position
+  calibrateStepper();
+//  delay(1000);
+ calibrateStepper2();
+
+//lightbulb
+pinMode(relaisPin, OUTPUT);
+
+
+//Fine tuning - stepper offset
+currentPositionWeather = 1995;
+
+ // updateWeatherData();
+ // moveToTemperature(10);
+
+
+// OTA Update Stuff
+  if (!MDNS.begin(host)) { //http://esp32.local
+    Serial.println("Error setting up MDNS responder!");
+    while (1) {
+      delay(1000);
+    }
+  }
+  Serial.println("mDNS responder started");
+  /*return index page which is stored in serverIndex */
+  server.on("/", HTTP_GET, []() {
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/html", loginIndex);
+  });
+  server.on("/serverIndex", HTTP_GET, []() {
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/html", serverIndex);
+  });
+  /*handling uploading firmware file */
+  server.on("/update", HTTP_POST, []() {
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
+    ESP.restart();
+  }, []() {
+    HTTPUpload& upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      Serial.printf("Update: %s\n", upload.filename.c_str());
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { //start with max available size
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      /* flashing firmware to ESP*/
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (Update.end(true)) { //true to set the size to the current progress
+        Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
+      } else {
+        Update.printError(Serial);
+      }
+    }
+  });
+  server.begin();
+
+
+}
+
+void loop() {
+
+// Check WiFi and Reconnect if offline  
+if (WiFi.status() != WL_CONNECTED) {
+ connectWifi();
+ }
+
+//OTA Update Stuff
+  server.handleClient();
+
+
+
+// read touch sensor pipe, turn on lightbulb feedback
+touchValue = touchRead(touchPin);
+   Serial.println("touchValue");
+   Serial.println(touchValue);
+   Serial.println("LichtEin");
+   Serial.println(lichtEin);
+
+  if(touchValue < threshold) {
+    lichtEin = !lichtEin; // switch lightbulb feedback wanted on/off
+    
+    if(lichtEin) {
+      digitalWrite(relaisPin, LOW); // Turn on Lightbulb
+      delay(1000); // Warte 2 Sekunden
+      digitalWrite(relaisPin, HIGH); // Turn off Lightbulb
+      delay(1000);
+      digitalWrite(relaisPin, LOW); // Turn on Lightbulb
+      delay(1000); // Warte 2 Sekunden
+      digitalWrite(relaisPin, HIGH); // Turn off Lightbulb
+    } else {
+      digitalWrite(relaisPin, LOW); // Turn on Lightbulb
+      delay(5000); // Warte 2 Sekunden
+      digitalWrite(relaisPin, HIGH); // Turn off Lightbulb
+    }
+  }
+
+  unsigned long currentTime = millis();
+
+  //read potentiometer, set day to display
+  potValue = analogRead(potPin);
+  int selection = -1;
+  if (potValue >= 0 && potValue <= 750) {
+    selection = 0;
+  } else if (potValue > 751 && potValue <= 2500) {
+    selection = 1;
+  } else if (potValue > 2501 && potValue <= 5000) {
+    selection = 2;
+  }
+
+  if(selection != -1) {
+    if (selection != prevSelection || (currentTime - prevTime >= updateInterval)) {
+      prevSelection = selection;
+      prevTime = currentTime;
+      updateWeatherData(); //get new weather data from API
+      switch (selection) {
+        case 0:
+
+          if (lichtEin == 1) {
+             digitalWrite(relaisPin, LOW);
+         }
+          moveToTemperature(tempHeute); //move stepper
+          moveToWeather(witterungHeute); //move stepper
+          digitalWrite(relaisPin, HIGH); //turn lightbulb off
+          break;
+        case 1:
+          if (lichtEin == 1) {
+             digitalWrite(relaisPin, LOW);
+         }
+          moveToTemperature(tempMorgen); //move stepper
+          moveToWeather(witterungMorgen); //move stepper
+          digitalWrite(relaisPin, HIGH); //turn lightbulb off
+          break;
+        case 2:
+          if (lichtEin == 1) {
+             digitalWrite(relaisPin, LOW);
+         }
+          moveToTemperature(tempUbermorgen); //move stepper
+          moveToWeather(witterungUbermorgen); //move stepper
+          digitalWrite(relaisPin, HIGH); //turn lightbulb off
+          break;
+        default:
+          break;
+      }
+    }
+}
+}
+
+
